@@ -319,48 +319,25 @@ impl<T: Translation> Mapping<T> {
             range,
             &mut |mr: &MemoryRegion, d: &Descriptor, level: usize| {
                 if d.is_valid() {
-                    let err = MapError::BreakBeforeMakeViolation(mr.clone());
-
-                    // Get the new flags and output address for this descriptor by applying
-                    // the updater function to a copy
-                    let (flags, oa) = {
-                        let mut dd = Descriptor::EMPTY;
-                        dd.assign(updater(mr, d, level).or(Err(err.clone()))?);
-                        (dd.flags(), dd.output_address())
-                    };
-
-                    if mr.is_block(level) && !flags.contains(Attributes::VALID) {
-                        // Removing the valid bit on an entire block mapping is always ok
-                        return Ok(());
-                    }
-
-                    if oa != d.output_address() {
-                        // Cannot change output address on a live mapping
-                        return Err(err);
-                    }
-
-                    let desc_flags = d.flags();
-
-                    if !mr.is_block(level) && flags != desc_flags {
-                        // The region being mapped is smaller than a block mapping at the current
-                        // level. Given that the block mapping is live, replacing it with a table
-                        // mapping is not allowed by BBM. However, if the output address and flags
-                        // of the new smaller mapping match the ones of the block mapping, nothing
-                        // needs to be done and so it can be allowed.
-                        return Err(err);
-                    }
-
-                    if (desc_flags ^ flags).intersects(
-                        Attributes::ATTRIBUTE_INDEX_MASK | Attributes::SHAREABILITY_MASK,
-                    ) {
-                        // Cannot change memory type
-                        return Err(err);
-                    }
-
-                    if (desc_flags - flags).contains(Attributes::NON_GLOBAL) {
-                        // Cannot convert from non-global to global
-                        return Err(err);
-                    }
+                    return updater(mr, d, level)
+                        .and_then(|bits| {
+                            d.apply_masks(
+                                Attributes::from_bits_retain(bits & !d.bits()),
+                                Attributes::from_bits_retain(d.bits() & !bits),
+                            )
+                        })
+                        .and_then(|bits| {
+                            if !mr.is_block(level) && d.bits() != bits {
+                                // The region being mapped is smaller than a block mapping at the current
+                                // level. Given that the block mapping is live, replacing it with a table
+                                // mapping is not allowed by BBM. However, if the output address and flags
+                                // of the new smaller mapping match the ones of the block mapping, nothing
+                                // needs to be done and so it can be allowed.
+                                return Err(());
+                            }
+                            Ok(())
+                        })
+                        .or(Err(MapError::BreakBeforeMakeViolation(mr.clone())));
                 }
                 Ok(())
             },
@@ -419,9 +396,12 @@ impl<T: Translation> Mapping<T> {
             let c = |mr: &MemoryRegion, _: &Descriptor, lvl: usize| {
                 let mask = !(paging::granularity_at_level(lvl) - 1);
                 let pa = (mr.start() - range.start() + pa.0) & mask;
-                let mut d = Descriptor::EMPTY;
-                d.set(PhysicalAddress(pa), flags);
-                Ok(d.bits())
+                let flags = if lvl == 3 {
+                    flags | Attributes::TABLE_OR_PAGE
+                } else {
+                    flags
+                };
+                Ok(Descriptor::compose(PhysicalAddress(pa), flags))
             };
             self.check_range_bbm(range, &c)?;
         }
